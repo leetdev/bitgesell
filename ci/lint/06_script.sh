@@ -6,13 +6,12 @@
 
 export LC_ALL=C
 
-if [ "$TRAVIS_EVENT_TYPE" = "pull_request" ]; then
-  # TRAVIS_BRANCH will be present in a Travis environment. For builds triggered
-  # by a pull request this is the name of the branch targeted by the pull request.
-  # https://docs.travis-ci.com/user/environment-variables/
-  COMMIT_RANGE="$TRAVIS_BRANCH..HEAD"
-  test/lint/commit-script-check.sh $COMMIT_RANGE
+GIT_HEAD=$(git rev-parse HEAD)
+if [ -n "$CIRRUS_PR" ]; then
+  COMMIT_RANGE="${CIRRUS_BASE_SHA}..$GIT_HEAD"
+  test/lint/commit-script-check.sh "$COMMIT_RANGE"
 fi
+export COMMIT_RANGE
 
 test/lint/git-subtree-check.sh src/crypto/ctaes
 test/lint/git-subtree-check.sh src/secp256k1
@@ -23,7 +22,7 @@ test/lint/check-doc.py
 test/lint/check-rpc-mappings.py .
 test/lint/lint-all.sh
 
-if [ "$CIRRUS_REPO_FULL_NAME" = "BGL/BGL" ] && [ "$CIRRUS_PR" = "" ] ; then
+if [ "$CIRRUS_REPO_FULL_NAME" = "BitgesellOfficial/bitgesell" ] && [ "$CIRRUS_PR" = "" ] ; then
     # Sanity check only the last few commits to get notified of missing sigs,
     # missing keys, or expired keys. Usually there is only one new merge commit
     # per push on the master branch and a few commits on release branches, so

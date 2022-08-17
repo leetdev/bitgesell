@@ -1,18 +1,74 @@
 env:
+  PACKAGE_MANAGER_INSTALL: "apt-get update && apt-get install -y"
   MAKEJOBS: "-j4"
   RUN_TESTS: "true"
   BASE_OUTDIR: "$CIRRUS_WORKING_DIR/out_dir_base"
   DEBIAN_FRONTEND: "noninteractive"
+  CCACHE_SIZE: "200M"
+  CCACHE_DIR: "/tmp/ccache_dir"
+  CCACHE_NOHASHDIR: "1"  # Debug info might contain a stale path if the build dir changes, but this is fine
+
+cirrus_ephemeral_worker_template_env: &CIRRUS_EPHEMERAL_WORKER_TEMPLATE_ENV
+  DANGER_RUN_CI_ON_HOST: "1"  # Containers will be discarded after the run, so there is no risk that the ci scripts modify the system
+
+persistent_worker_template_env: &PERSISTENT_WORKER_TEMPLATE_ENV
+  RESTART_CI_DOCKER_BEFORE_RUN: "1"
+
+persistent_worker_template: &PERSISTENT_WORKER_TEMPLATE
+  persistent_worker: {}  # https://cirrus-ci.org/guide/persistent-workers/
+
+# https://cirrus-ci.org/guide/tips-and-tricks/#sharing-configuration-between-tasks
+filter_template: &FILTER_TEMPLATE
+  stateful: false  # https://cirrus-ci.org/guide/writing-tasks/#stateful-tasks
+
+base_template: &BASE_TEMPLATE
+  << : *FILTER_TEMPLATE
+  merge_base_script:
+    # Unconditionally install git (used in fingerprint_script) and set the
+    # default git author name (used in verify-commits.py)
+    - bash -c "$PACKAGE_MANAGER_INSTALL git"
+    - git config --global user.email "ci@ci.ci"
+    - git config --global user.name "ci"
+    - if [ "$CIRRUS_PR" = "" ]; then exit 0; fi
+    - git fetch $CIRRUS_REPO_CLONE_URL $CIRRUS_BASE_BRANCH
+    - git merge FETCH_HEAD  # Merge base to detect silent merge conflicts
+
+main_template: &MAIN_TEMPLATE
+  timeout_in: 120m  # https://cirrus-ci.org/faq/#instance-timed-out
+  ccache_cache:
+    folder: "/tmp/ccache_dir"
+  ci_script:
+    - ./ci/test_run_all.sh
+
+global_task_template: &GLOBAL_TASK_TEMPLATE
+  << : *BASE_TEMPLATE
+  container:
+    # https://cirrus-ci.org/faq/#are-there-any-limits
+    # Each project has 16 CPU in total, assign 2 to each container, so that 8 tasks run in parallel
+    cpu: 2
+    greedy: true
+    memory: 8G  # Set to 8GB to avoid OOM. https://cirrus-ci.org/guide/linux/#linux-containers
+  depends_built_cache:
+    folder: "depends/built"
+    fingerprint_script: echo $CIRRUS_TASK_NAME $(git rev-list -1 HEAD ./depends)
+  << : *MAIN_TEMPLATE
+
+compute_credits_template: &CREDITS_TEMPLATE
+  # https://cirrus-ci.org/pricing/#compute-credits
+  # Only use credits for pull requests to the main repo
+  use_compute_credits: $CIRRUS_REPO_FULL_NAME == 'BitgesellOfficial/bitgesell' && $CIRRUS_PR != ""
 
 task:
+  name: 'lint [bionic]'
+  << : *BASE_TEMPLATE
   container:
-    image: ubuntu:focal
+    image: ubuntu:bionic
     cpu: 1
     memory: 1G
   # For faster CI feedback, immediately schedule the linters
   << : *CREDITS_TEMPLATE
   lint_script:
-    - ./ci/lint_run_all.sh
+    - bash ./ci/lint_run_all.sh
   env:
     << : *CIRRUS_EPHEMERAL_WORKER_TEMPLATE_ENV
 
@@ -133,7 +189,7 @@ task:
   name: '32-bit + dash [gui] [CentOS 8]'
   << : *GLOBAL_TASK_TEMPLATE
   container:
-    image: centos:8
+    image: quay.io/centos/centos:stream8
   env:
     << : *CIRRUS_EPHEMERAL_WORKER_TEMPLATE_ENV
     PACKAGE_MANAGER_INSTALL: "yum install -y"
@@ -150,18 +206,6 @@ task:
     FILE_ENV: "./ci/test/00_setup_env_native_qt5.sh"
 
 task:
-  name: '[depends, sanitizers: thread (TSan), no gui] [hirsute]'
-  << : *GLOBAL_TASK_TEMPLATE
-  container:
-    image: ubuntu:hirsute
-    cpu: 6  # Increase CPU and Memory to avoid timeout
-    memory: 24G
-  env:
-    << : *CIRRUS_EPHEMERAL_WORKER_TEMPLATE_ENV
-    MAKEJOBS: "-j8"
-    FILE_ENV: "./ci/test/00_setup_env_native_tsan.sh"
-
-task:
   name: '[depends, sanitizers: memory (MSan)] [focal]'
   << : *GLOBAL_TASK_TEMPLATE
   container:
@@ -171,10 +215,10 @@ task:
     FILE_ENV: "./ci/test/00_setup_env_native_msan.sh"
 
 task:
-  name: '[no depends, sanitizers: address/leak (ASan + LSan) + undefined (UBSan) + integer] [hirsute]'
+  name: '[no depends, sanitizers: address/leak (ASan + LSan) + undefined (UBSan) + integer] [jammy]'
   << : *GLOBAL_TASK_TEMPLATE
   container:
-    image: ubuntu:hirsute
+    image: ubuntu:jammy
   env:
     << : *CIRRUS_EPHEMERAL_WORKER_TEMPLATE_ENV
     FILE_ENV: "./ci/test/00_setup_env_native_asan.sh"
@@ -215,11 +259,15 @@ task:
 
 task:
   name: 'macOS 10.15 [gui, no tests] [focal]'
-  << : *DEPENDS_SDK_CACHE_TEMPLATE
-  << : *GLOBAL_TASK_TEMPLATE
+  << : *BASE_TEMPLATE
+  macos_sdk_cache:
+    folder: "depends/SDKs/$MACOS_SDK"
+    fingerprint_key: "$MACOS_SDK"
+  << : *MAIN_TEMPLATE
   container:
     image: ubuntu:focal
   env:
+    MACOS_SDK: "Xcode-12.2-12B45b-extracted-SDK-with-libcxx-headers"
     << : *CIRRUS_EPHEMERAL_WORKER_TEMPLATE_ENV
     FILE_ENV: "./ci/test/00_setup_env_mac.sh"
 
@@ -239,8 +287,10 @@ task:
 
 task:
   name: 'ARM64 Android APK [focal]'
-  << : *DEPENDS_SDK_CACHE_TEMPLATE
   << : *BASE_TEMPLATE
+  android_sdk_cache:
+    folder: "depends/SDKs/android"
+    fingerprint_key: "ANDROID_API_LEVEL=28 ANDROID_BUILD_TOOLS_VERSION=28.0.3 ANDROID_NDK_VERSION=23.2.8568313"
   depends_sources_cache:
     folder: "depends/sources"
     fingerprint_script: git rev-list -1 HEAD ./depends
